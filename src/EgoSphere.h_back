@@ -1,0 +1,603 @@
+#ifndef SPHERICALSHELL_H
+#define SPHERICALSHELL_H
+#include "opencv2/core/core.hpp"
+#include "opencv2/imgproc/imgproc.hpp"
+#include <opencv/cv.h>
+#include <opencv/highgui.h>
+#include <pcl/point_cloud.h>
+#include <pcl/common/transforms.h>
+
+#include <moveit_msgs/GetPositionIK.h>
+#include <moveit/robot_model_loader/robot_model_loader.h>
+#include <moveit/robot_state/robot_state.h>
+#include <moveit/robot_model_loader/robot_model_loader.h>
+#include <moveit/planning_interface/planning_interface.h>
+#include <moveit/planning_scene/planning_scene.h>
+#include <moveit/kinematic_constraints/utils.h>
+#include <moveit_msgs/DisplayTrajectory.h>
+#include <moveit_msgs/PlanningScene.h>
+#include <moveit/move_group_interface/move_group.h>
+#include <moveit/planning_scene_interface/planning_scene_interface.h>
+#include <moveit_msgs/DisplayRobotState.h>
+#include <moveit_msgs/DisplayTrajectory.h>
+#include <moveit_msgs/AttachedCollisionObject.h>
+#include <moveit_msgs/CollisionObject.h>
+#include <std_msgs/Float64.h>
+#include "structures.h"
+#include <boost/archive/text_oarchive.hpp>
+#include <boost/archive/text_iarchive.hpp>
+#include <pcl/kdtree/kdtree_flann.h>
+
+
+template <class T>
+class SphericalShell
+{
+public:
+
+    double y_offset;
+    double mahalanobis_distance_threshold;
+    double uncertainty_lower_bound;
+    double field_of_view;
+    T structure;
+    std::vector<MemoryPatch> structure_data_aux;
+
+    pcl::PointCloud<pcl::PointXYZ>::Ptr structure_cloud;
+    pcl::KdTreeFLANN<pcl::PointXYZ> structure_cloud_kdtree;
+
+    //std::vector<std::vector<std::vector<boost::shared_ptr<MemoryPatch> > > > hash_table; // Phi , Theta
+
+    Eigen::Vector3d north_direction;
+    SphericalShell() : north_direction(Eigen::Vector3d::UnitZ())
+    {}
+
+    // NOTE: ANGLE THRESHOLD IS IN DEGREES
+    SphericalShell(const unsigned int & _egosphere_nodes,
+                   const double & uncertainty_lower_bound_,
+                   const double & mahalanobis_distance_threshold_,
+                   const cv::Mat & mean_,
+                   const cv::Mat & standard_deviation_,
+                   const double & y_offset_,
+                   const double & neighbour_angle_threshold_) :
+        egosphere_nodes(_egosphere_nodes),
+        uncertainty_lower_bound(uncertainty_lower_bound_),
+        mahalanobis_distance_threshold(mahalanobis_distance_threshold_),
+        // Moveit stuff
+        robot_model_loader("robot_description"),
+        robot_model(robot_model_loader.getModel()),
+        head_joint_model_group(robot_model->getJointModelGroup("head")),
+        head_group(new moveit::planning_interface::MoveGroup("head")),
+        y_offset(y_offset_),
+        neighbour_dot_product_threshold(cos(neighbour_angle_threshold_*M_PI/180.0)),
+        north_direction(Eigen::Vector3d(0,0,1.0))
+    {
+        structure_data_aux.reserve(egosphere_nodes);
+        structure_cloud=pcl::PointCloud<pcl::PointXYZ>::Ptr (new pcl::PointCloud<pcl::PointXYZ>);
+
+        head_joint_names=head_group->getActiveJoints();
+        head_joint_values.resize(head_joint_names.size());
+        std::cout << head_joint_names[0] << " " << head_joint_names[1] << " " << head_joint_names[2] << std::endl;
+
+        init(mean_,standard_deviation_);
+    }
+
+    void init(const cv::Mat & mean_mat, const cv::Mat & std_dev_mat)
+    {
+        std::cout << "initializing random spherical shell..." << std::endl;
+        std_msgs::Float64 neck_pan_angle;
+        std_msgs::Float64 neck_tilt_angle;
+
+        ROS_INFO("Going to move eyes to home position.");
+        //head_group->setNamedTarget("head_home");
+        //head_group->move();
+        int p=0;
+        while(p<egosphere_nodes)
+        {
+            Eigen::Vector3d random_point;
+            cv::Mat aux(1, 1, CV_64F);
+
+            // Generate random patch on the sphere surface
+            cv::randn(aux, mean_mat.at<double>(0,0), std_dev_mat.at<double>(0,0));
+            random_point(0,0)=aux.at<double>(0,0);
+
+            cv::randn(aux, mean_mat.at<double>(1,0), std_dev_mat.at<double>(1,0));
+            random_point(1,0)=aux.at<double>(0,0);
+
+            cv::randn(aux, mean_mat.at<double>(2,0), std_dev_mat.at<double>(2,0));
+            random_point(2,0)=aux.at<double>(0,0);
+
+            // If not kinematically possible, continue
+
+            Eigen::Vector3d fixation_point;
+
+            fixation_point(0)=random_point(0,0);
+            fixation_point(1)=random_point(1,0);
+            fixation_point(2)=random_point(2,0);
+            Eigen::Vector3d fixation_point_normalized=fixation_point.normalized();
+
+            if(fixation_point_normalized.x()!=fixation_point_normalized.x())
+            {
+                neck_pan_angle.data=0.0;
+                neck_tilt_angle.data=0.0;
+            }
+            else
+            {
+
+                double x=fixation_point.x();
+                double y=fixation_point.y();
+                double z=fixation_point.z();
+
+                double neck_pan_angle_=atan2(x,z);
+                double tilt_angle;
+                double aux=(-y*y_offset + sqrt((x*x + z*z)*(x*x + y*y - y_offset*y_offset + z*z)));
+                if(y<-y_offset)
+                    tilt_angle=acos(aux/(fixation_point.squaredNorm()));
+                else
+                    tilt_angle=-acos(aux/(fixation_point.squaredNorm()));
+
+                neck_pan_angle.data=neck_pan_angle_;
+                neck_tilt_angle.data=tilt_angle;
+            }
+
+            head_joint_values[0] = neck_pan_angle.data;
+            head_joint_values[1] = neck_tilt_angle.data;
+            head_joint_values[2] = 0;
+
+            if(!head_group->setJointValueTarget(head_joint_values))
+            {
+                continue;
+            }
+
+            // Store
+            boost::shared_ptr<MemoryPatch> patch(new MemoryPatch(random_point.normalized()));
+
+            structure.push_back(patch);
+
+            ///////////////////////////////
+            // Insert in pcl point cloud //
+            ///////////////////////////////
+
+            pcl::PointXYZ pcl_point;
+            pcl_point.getVector3fMap() = random_point.normalized().cast<float>();
+            structure_cloud->push_back(pcl_point);
+            ++p;
+        }
+
+        structure_cloud_kdtree.setInputCloud (structure_cloud);
+
+        std::cout << "done." << std::endl;
+    }
+
+
+    void insertKdTree(const pcl::PointCloud<pcl::PointXYZRGB> & observations,
+                      const std::vector<Eigen::Matrix3d> & covariances,
+                      const Eigen::Vector3d & sensor_direction,
+                      const double & field_of_view)
+    {
+        double cos_field_of_view=cos(0.5*field_of_view*M_PI/180.0);
+        // K nearest neighbor search
+        if (observations.size()>0)
+        {
+            int K = 1;
+            std::vector<int> pointIdxNKNSearch(K);
+            std::vector<float> pointNKNSquaredDistance(K);
+
+            // Construct observations tree
+
+            pcl::PointCloud<pcl::PointXYZ> observations_normalized;
+            observations_normalized.reserve(observations.size());
+            for(int o=0; o<observations.size();++o)
+            {
+                pcl::PointXYZ point_normalized;
+                point_normalized.getVector3fMap() = observations[o].getVector3fMap().normalized();
+                observations_normalized.push_back(point_normalized);
+            }
+
+            pcl::KdTreeFLANN<pcl::PointXYZ> observations_cloud_kdtree;
+            observations_cloud_kdtree.setInputCloud (observations_normalized.makeShared());
+
+            for(std::vector<boost::shared_ptr<MemoryPatch> >::iterator structure_it = structure.begin(); structure_it != structure.end(); ++structure_it)
+            {
+                // Check if it is within the field of view of the sensor
+                double dot_product=(*structure_it)->cartesian_position.dot(sensor_direction);
+                if(dot_product>cos_field_of_view)
+                {
+                    // 1. Update structure cell vector
+                    pcl::PointXYZ searchPoint;
+                    searchPoint.getVector3fMap() = (*structure_it)->cartesian_position.cast<float>();
+
+                    if ( observations_cloud_kdtree.nearestKSearch (searchPoint, K, pointIdxNKNSearch, pointNKNSquaredDistance) > 0 )
+                    {
+                        unsigned int nn_index=pointIdxNKNSearch[0];
+                        //double dot_product=(*structure_it)->cartesian_position.dot(observations_normalized[nn_index].getVector3fMap().cast<double>());
+                        //if(dot_product>neighbour_dot_product_threshold)
+                        //{
+                            Gaussian<3> gaussian_cartesian_position(observations[nn_index].getArray3fMap().cast<double>(),covariances[nn_index]);
+
+                            // update position
+                            (*structure_it)->sensory_data.position.update(gaussian_cartesian_position,mahalanobis_distance_threshold);
+
+                            // update rgb
+                            (*structure_it)->sensory_data.rgb=observations[nn_index];
+                        //}
+                    }
+                }
+            }
+        }
+    }
+
+    // Update when moved
+    bool transform(const Eigen::Matrix4d & pose_shift_m)
+    {
+        Eigen::AngleAxis<double> rot(pose_shift_m.block<3,3>(0,0));
+
+        /*// CONSIDER ONLY DISPLACEMENTS ABOVE A THRESHOLD
+        if(rot.angle()<0.02&&pose_shift_m.block<3,1>(0,3).norm()<0.01)
+        {
+            return false;
+        }//*/
+
+        ////////////////////////////////////
+        // 1. update ego sphere structure //
+        ////////////////////////////////////
+
+        Eigen::Transform<double,3, Eigen::Affine> pose_shift_transform(pose_shift_m);
+
+        // update north
+        Eigen::Vector3d aux=pose_shift_transform.inverse() * north_direction;
+        north_direction=aux;
+
+        //ROS_ERROR_STREAM(pose_shift_transform.matrix());
+        structure_cloud->clear();
+        structure_data_aux.clear();
+        for(std::vector<boost::shared_ptr<MemoryPatch> >::iterator structure_it = structure.begin(); structure_it != structure.end(); ++structure_it)
+        {
+            // 1. Update structure cell vector
+            Eigen::Vector3d aux=pose_shift_transform * (*structure_it)->cartesian_position;
+            (*structure_it)->cartesian_position=aux.normalized();
+            pcl::PointXYZ pcl_point;
+            pcl_point.getVector3fMap() = (*structure_it)->cartesian_position.cast<float>();
+            structure_cloud->push_back(pcl_point);
+
+            // 2. Transform sensory_data and find new associated cell
+            // Transform only informative points
+            if(!(*structure_it)->sensory_data.position.isEmpty())
+            {
+                // TRANSFORM MEAN
+                (*structure_it)->sensory_data.position.mean.noalias()=pose_shift_transform*(*structure_it)->sensory_data.position.mean;
+
+                // ROTATE INFORMATION MATRICES
+                (*structure_it)->sensory_data.position.information.noalias()=pose_shift_m.block(0,0,3,3)*(*structure_it)->sensory_data.position.information*pose_shift_m.block(0,0,3,3).transpose();
+            }
+            structure_data_aux.push_back(*(*structure_it));
+            (*structure_it)->sensory_data.reset();
+        }
+        //////////////////////////////////////
+        // 2. update sensory data (re-fused)//
+        //////////////////////////////////////
+
+        if (structure_data_aux.size()>0)
+        {
+
+            // NORMALIZE OBSERVATIONS
+            pcl::PointCloud<pcl::PointXYZ> observations_normalized;
+            observations_normalized.reserve(structure_data_aux.size());
+            for(std::vector<MemoryPatch>::iterator structure_data_aux_it = structure_data_aux.begin(); structure_data_aux_it != structure_data_aux.end(); ++structure_data_aux_it)
+            {
+                pcl::PointXYZ point_normalized;
+                if(!structure_data_aux_it->sensory_data.position.isEmpty())
+                {
+                    point_normalized.getVector3fMap() = structure_data_aux_it->sensory_data.position.mean.normalized().cast<float>();
+                }
+                else
+                {
+                    point_normalized.getVector3fMap() = structure_data_aux_it->cartesian_position.cast<float>();
+                }
+                observations_normalized.push_back(point_normalized);
+            }
+
+            int K = 1;
+            std::vector<int> pointIdxNKNSearch(K);
+            std::vector<float> pointNKNSquaredDistance(K);
+
+            // Option one: from observations to the egosphere (DATA NEVER GETS LOST)
+            /*structure_cloud_kdtree.setInputCloud (structure_cloud);
+
+
+            for(pcl::PointCloud<pcl::PointXYZ>::iterator observations_normalized_it = observations_normalized.begin(); observations_normalized_it != observations_normalized.end(); ++observations_normalized_it)
+            {
+
+                if ( structure_cloud_kdtree.nearestKSearch (*observations_normalized_it, K, pointIdxNKNSearch, pointNKNSquaredDistance) > 0 )
+                {
+                    unsigned int nn_index=pointIdxNKNSearch[0];
+
+
+                    // update xyz
+                    structure[nn_index]->sensory_data.position.update(structure_data_aux[nn_index].sensory_data.position,mahalanobis_distance_threshold);
+
+                    // update rgb
+                    structure[nn_index]->sensory_data.rgb=structure_data_aux[nn_index].sensory_data.rgb;
+
+                }
+            }*/
+
+            // Option two: from the ego sphere to the observations
+            // K nearest neighbor search
+
+            // Construct observations tree
+            pcl::KdTreeFLANN<pcl::PointXYZ> observations_cloud_kdtree;
+            observations_cloud_kdtree.setInputCloud (observations_normalized.makeShared()                                                                                                                                                                                               );
+
+            for(std::vector<boost::shared_ptr<MemoryPatch> >::iterator structure_it = structure.begin(); structure_it != structure.end(); ++structure_it)
+            {
+                pcl::PointXYZ searchPoint;
+                searchPoint.getVector3fMap() = (*structure_it)->cartesian_position.cast<float>();
+
+                if ( observations_cloud_kdtree.nearestKSearch (searchPoint, K, pointIdxNKNSearch, pointNKNSquaredDistance) > 0 )
+                {
+                    unsigned int nn_index=pointIdxNKNSearch[0];
+
+                    // Check if it is within the dot product threshold ( faster than angle )
+                    double dot_product=(*structure_it)->cartesian_position.dot(observations_normalized[nn_index].getVector3fMap().cast<double>());
+                    if(dot_product>neighbour_dot_product_threshold)
+                    {
+                        // update xyz
+                        (*structure_it)->sensory_data.position.update(structure_data_aux[nn_index].sensory_data.position,mahalanobis_distance_threshold);
+
+                        // update rgb
+                        (*structure_it)->sensory_data.rgb=structure_data_aux[nn_index].sensory_data.rgb;
+                    }
+                }
+            }
+
+        }
+        return true;
+    }
+
+    pcl::PointCloud<pcl::PointXYZRGB> getPointCloud()
+    {
+        pcl::PointCloud<pcl::PointXYZRGB> point_cloud;
+
+        for(std::vector<boost::shared_ptr<MemoryPatch> >::iterator structure_it = structure.begin(); structure_it != structure.end(); ++structure_it)
+        {
+            double volume=(*structure_it)->sensory_data.position.getVolume();
+
+            if(volume<uncertainty_lower_bound|| volume!=volume)
+            {
+                //std::cout << volume << std::endl;
+                continue;
+            }
+
+            pcl::PointXYZRGB point((*structure_it)->sensory_data.rgb);
+
+            point.getVector3fMap() = (*structure_it)->sensory_data.position.mean.cast<float>();
+            point_cloud.push_back(point);
+        }
+
+        return point_cloud;
+    }
+
+
+    pcl::PointCloud<pcl::PointXYZI> getPointCloudUncertainty()
+    {
+        pcl::PointCloud<pcl::PointXYZI> point_cloud;
+
+        for(std::vector<boost::shared_ptr<MemoryPatch> >::iterator structure_it = structure.begin(); structure_it != structure.end(); ++structure_it)
+        {
+            //double norm_=(information_matrix.norm()); // L2 norm
+            double volume=(*structure_it)->sensory_data.position.getVolume();
+
+            if(log(volume)<uncertainty_lower_bound|| isnan(log(volume)) || volume!=volume)
+            {
+                continue;
+            }
+
+            pcl::PointXYZI point;
+            point.intensity=volume;
+
+            point.getVector3fMap() = (*structure_it)->sensory_data.position.mean.cast<float>();
+            point_cloud.push_back(point);
+        }
+
+
+        return point_cloud;
+    }
+
+    pcl::PointCloud<pcl::PointXYZI> getPointCloudUncertaintyViz()
+    {
+        pcl::PointCloud<pcl::PointXYZI> point_cloud;
+
+        for(std::vector<boost::shared_ptr<MemoryPatch> >::iterator structure_it = structure.begin(); structure_it != structure.end(); ++structure_it)
+        {
+            //double norm_=(information_matrix.norm()); // L2 norm
+            double volume=(*structure_it)->sensory_data.position.getVolume();
+
+            if(log(volume)<uncertainty_lower_bound|| isnan(log(volume)) ||volume!=volume)
+            {
+                continue;
+            }
+
+            pcl::PointXYZI point;
+            point.intensity=log(volume);
+
+            point.getVector3fMap() = (*structure_it)->sensory_data.position.mean.cast<float>();
+            point_cloud.push_back(point);
+        }
+
+        return point_cloud;
+    }
+
+    std::vector<Eigen::Matrix<double, 3, 3> > getCovariances()
+    {
+        std::vector<Eigen::Matrix<double, 3, 3> > covs;
+
+        for(std::vector<boost::shared_ptr<MemoryPatch> >::iterator structure_it = structure.begin(); structure_it != structure.end(); ++structure_it)
+        {
+            //double norm_=(information_matrix.norm()); // L2 norm
+            double volume=(*structure_it)->sensory_data.position.getVolume();
+
+            if(log(volume)<uncertainty_lower_bound || isnan(log(volume)) ||volume!=volume)
+            {
+                continue;
+            }
+
+            //double norm_=(information_matrix.norm()); // L2 norm
+            covs.push_back((*structure_it)->sensory_data.position.information.inverse());
+        }
+
+        return covs;
+    }
+
+    pcl::PointCloud<pcl::PointXYZ> getMeans()
+    {
+        pcl::PointCloud<pcl::PointXYZ> point_cloud;
+
+        for(std::vector<boost::shared_ptr<MemoryPatch> >::iterator structure_it = structure.begin(); structure_it != structure.end(); ++structure_it)
+        {
+            //double norm_=(information_matrix.norm()); // L2 norm
+            double volume=(*structure_it)->sensory_data.position.getVolume();
+
+            if(log(volume)<uncertainty_lower_bound || isnan(log(volume)) || volume!=volume)
+            {
+                continue;
+            }
+
+            pcl::PointXYZ point;
+
+            point.getVector3fMap() = (*structure_it)->sensory_data.position.mean.cast<float>();
+            point_cloud.push_back(point);
+        }
+
+        return point_cloud;
+    }
+
+private:
+
+    //void initFovGeodesicDome();
+    unsigned int egosphere_nodes;
+    double neighbour_dot_product_threshold;
+
+    // MoveIt! stuff
+    moveit::core::RobotStatePtr kinematic_state;
+    robot_model_loader::RobotModelLoader robot_model_loader;//("robot_description");
+    moveit::core::RobotModelPtr robot_model;// = robot_model_loader.getModel();
+
+    const moveit::core::JointModelGroup* head_joint_model_group;//kinematic_model->getJointModelGroup("head");
+    moveit::planning_interface::MoveGroup* head_group;
+
+    std::vector<double> head_joint_values;
+    std::vector<std::string> head_joint_names;
+
+    friend class boost::serialization::access;
+    template<class Archive>
+    void serialize(Archive & ar, const unsigned int version)
+    {
+        ar & egosphere_nodes;
+        ar & y_offset;
+        ar & mahalanobis_distance_threshold;
+        ar & uncertainty_lower_bound;
+        ar & structure;
+        ar & structure_cloud;
+        ar & neighbour_dot_product_threshold;
+        structure_cloud_kdtree.setInputCloud (structure_cloud);
+    }
+};
+
+
+namespace boost{
+namespace serialization{
+
+template<   class Archive,
+            class S,
+            int Rows_,
+            int Cols_,
+            int Ops_,
+            int MaxRows_,
+            int MaxCols_>
+inline void save(
+        Archive & ar,
+        const Eigen::Matrix<S, Rows_, Cols_, Ops_, MaxRows_, MaxCols_> & g,
+        const unsigned int version)
+{
+    int rows = g.rows();
+    int cols = g.cols();
+
+    ar & rows;
+    ar & cols;
+    ar & boost::serialization::make_array(g.data(), rows * cols);
+}
+
+template<   class Archive,
+            class S,
+            int Rows_,
+            int Cols_,
+            int Ops_,
+            int MaxRows_,
+            int MaxCols_>
+inline void load(
+        Archive & ar,
+        Eigen::Matrix<S, Rows_, Cols_, Ops_, MaxRows_, MaxCols_> & g,
+        const unsigned int version)
+{
+    int rows, cols;
+    ar & rows;
+    ar & cols;
+    g.resize(rows, cols);
+    ar & boost::serialization::make_array(g.data(), rows * cols);
+}
+
+template<   class Archive,
+            class S,
+            int Rows_,
+            int Cols_,
+            int Ops_,
+            int MaxRows_,
+            int MaxCols_>
+inline void serialize(
+        Archive & ar,
+        Eigen::Matrix<S, Rows_, Cols_, Ops_, MaxRows_, MaxCols_> & g,
+        const unsigned int version)
+{
+    split_free(ar, g, version);
+}
+
+
+} // namespace serialization
+} // namespace
+
+
+
+namespace boost
+{
+namespace serialization
+{
+
+
+template<class Archive>
+void serialize(Archive & ar, pcl::PointCloud<pcl::PointXYZ>& g, const unsigned int version)
+{
+    ar & g.points;
+}
+
+template<class Archive>
+void serialize(Archive & ar, pcl::PointXYZ& g, const unsigned int version)
+{
+    ar & g.getVector3fMap().data()[0];
+    ar & g.getVector3fMap().data()[1];
+    ar & g.getVector3fMap().data()[2];
+}
+
+template<class Archive>
+void serialize(Archive & ar, pcl::PointXYZRGB& g, const unsigned int version)
+{
+    ar & g.getVector3fMap().data()[0];
+    ar & g.getVector3fMap().data()[1];
+    ar & g.getVector3fMap().data()[2];
+    ar & g.r;
+    ar & g.g;
+    ar & g.b;
+}
+
+} // namespace serialization
+} // namespace boost
+
+#endif // SPHERICALSHELL_H
