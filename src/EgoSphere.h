@@ -17,7 +17,7 @@
 #include <moveit/kinematic_constraints/utils.h>
 #include <moveit_msgs/DisplayTrajectory.h>
 #include <moveit_msgs/PlanningScene.h>
-#include <moveit/move_group_interface/move_group.h>
+#include <moveit/move_group_interface/move_group_interface.h>
 #include <moveit/planning_scene_interface/planning_scene_interface.h>
 #include <moveit_msgs/DisplayRobotState.h>
 #include <moveit_msgs/DisplayTrajectory.h>
@@ -115,7 +115,7 @@ public:
         robot_model_loader("robot_description"),
         robot_model(robot_model_loader.getModel()),
         head_joint_model_group(robot_model->getJointModelGroup("head")),
-        head_group(new moveit::planning_interface::MoveGroup("head"))
+        head_group(new moveit::planning_interface::MoveGroupInterface("head"))
     {
         head_joint_names=head_group->getActiveJoints();
         head_joint_values.resize(head_joint_names.size());
@@ -138,7 +138,7 @@ public:
         robot_model_loader("robot_description"),
         robot_model(robot_model_loader.getModel()),
         head_joint_model_group(robot_model->getJointModelGroup("head")),
-        head_group(new moveit::planning_interface::MoveGroup("head")),
+        head_group(new moveit::planning_interface::MoveGroupInterface("head")),
         y_offset(y_offset_),
         neighbour_dot_product_threshold(cos(neighbour_angle_threshold_*M_PI/180.0)),
         interpolate_dot_product_threshold(cos(interpolate_angle_threshold_*M_PI/180.0)),
@@ -766,7 +766,7 @@ private:
     moveit::core::RobotModelPtr robot_model;// = robot_model_loader.getModel();
 
     const moveit::core::JointModelGroup* head_joint_model_group;//kinematic_model->getJointModelGroup("head");
-    moveit::planning_interface::MoveGroup* head_group;
+    moveit::planning_interface::MoveGroupInterface* head_group;
 
     std::vector<double> head_joint_values;
     std::vector<std::string> head_joint_names;
